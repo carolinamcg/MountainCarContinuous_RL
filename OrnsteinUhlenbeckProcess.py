@@ -14,7 +14,7 @@ class AnnealedGaussianProcess(RandomProcess):
         self.n_steps = 0
 
         if sigma_min is not None:
-            self.m = -float(sigma - sigma_min) / float(n_steps_annealing)
+            self.m = -float(sigma - sigma_min) / float(n_steps_annealing) #n_steps_annealing is the number of steps it takes to get to the sigma_min value
             self.c = sigma
             self.sigma_min = sigma_min
         else:

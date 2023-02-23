@@ -3,6 +3,7 @@ import random
 import os
 import pandas as pd
 import numpy as np
+import cv2
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,7 +11,7 @@ from itertools import count
 from collections import namedtuple
 
 from replaymemorybuffer import ReplayMemory
-from utils import soft_update, to_numpy
+from utils import soft_update, to_numpy, plot_TDE
 
 # from DQNagent import DQNAC
 from DDPG_models import Actor, Critic
@@ -43,6 +44,9 @@ class Train(object):
         warmup_decay=200, #to decrease the warmup steps number at each episode
         noise_theta=0.15,
         noise_sigma=0.2,
+        sigma_min=None, 
+        n_steps_annealing=100,
+        eval_episodes=30,
         #EPS_END=0.05,
         #EPS_START=0.9,
         #EPS_DECAY=1000, ##decay approaches linear function and decreases slower with the number of steps, as this number is higher. it takes more nsteps to reach the EPS_END
@@ -78,7 +82,8 @@ class Train(object):
         self.criterion = nn.SmoothL1Loss()
         self.memory = ReplayMemory(memory_length)
         assert memory_length >= BATCH_SIZE, "ERROR: memory length has to be >= batch_size"
-        self.noise = OrnsteinUhlenbeckProcess(theta=noise_theta, sigma=noise_sigma, size=n_actions)
+        self.noise = OrnsteinUhlenbeckProcess(theta=noise_theta, sigma=noise_sigma, size=n_actions, 
+                                            sigma_min=sigma_min, n_steps_annealing=n_steps_annealing)
 
         #hyperparameters
         self.BATCH_SIZE = BATCH_SIZE
@@ -90,6 +95,7 @@ class Train(object):
         self.a_t = None # Most recent action
         self.is_training = True
         self.warmup = warmup_steps
+        self.eval_episodes = eval_episodes
 
         #self.steps_done = 0
         #self.EPS_END = EPS_END
@@ -100,6 +106,10 @@ class Train(object):
         self.warmup_decay = warmup_decay
 
         self.episode_durations = []
+        self.episode=0
+        self.save_path=None
+
+        self.check={"Episode": [], "Gt": [], "Predicted Value": [], "Q_loss": [], "P_loss": []}
 
     def set_warmup(self):  # force policy to be exploratory at the beginning
         new_warmup = self.end + (self.start - self.end) * math.exp(
@@ -133,37 +143,9 @@ class Train(object):
                 return torch.tensor(
                     [self.env.action_space.sample()], device=device, dtype=torch.float32
                 )
-
-    
-    def get_expected_return(self,
-        rewards: torch.tensor,
-        gamma: float, 
-        standardize: bool = True) -> torch.tensor:
-        """Compute expected returns per timestep."""
-
-        n = rewards.size()[0]
-        returns = torch.zeros(dtype=torch.float32, size=n)
-
-        # Start from the end of `rewards` and accumulate reward sums
-        # into the `returns` array
-        rewards = torch.cast(rewards[::-1], dtype=torch.float32)
-        discounted_sum = torch.constant(0.0)
-        discounted_sum_shape = discounted_sum.shape
-        for i in range(n):
-            reward = rewards[i]
-            discounted_sum = reward + gamma * discounted_sum
-            discounted_sum.set_shape(discounted_sum_shape)
-            returns = returns.write(i, discounted_sum)
-        returns = returns.stack()[::-1]
-
-        if standardize:
-            returns = ((returns - tf.math.reduce_mean(returns)) / 
-                    (tf.math.reduce_std(returns) + eps))
-
-        return returns
     '''
 
-    def optimize_model(self):
+    def optimize_model(self, terminated=False):
         transitions = self.memory.sample(self.BATCH_SIZE)
         # Transpose the batch (see https://stackoverflow.com/a/19343/3343043 for
         # detailed explanation). This converts batch-array of Transitions
@@ -243,6 +225,22 @@ class Train(object):
         policy_loss.backward()
         self.actor_optim.step()
 
+        if terminated:
+            #PLOT STATE and ACTION vs TDE 
+            TDE = expected_state_action_values - next_state_values
+            plot_TDE(state_batch, action_batch, TDE, self.episode, self.save_path)
+            del TDE
+
+        if len([s for s in batch.next_state if s is None])>0:
+            #print("INCLUDED terminal state in memory buffer")
+            i = torch.where(non_final_mask==False)[0]
+            self.check["Episode"].append(self.episode)
+            self.check["Gt"].append(expected_state_action_values[i].cpu().numpy())
+            self.check["Predicted Value"].append(state_action_values[i].detach().cpu().numpy())
+            self.check["Q_loss"].append(Q_loss.item())
+            self.check["P_loss"].append(policy_loss.item())
+            #print(expected_state_action_values[i].cpu().numpy(), state_action_values[i].detach().cpu().numpy())
+            #print(Q_loss.item(), policy_loss.item())
         # In-place gradient clipping
         # torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
         return Q_loss, policy_loss
@@ -281,10 +279,11 @@ class Train(object):
         return action
 
     def train(self, num_episodes, max_steps=500, w_path="./weights"):
+        self.save_path = w_path
         max_ER, min_no_steps = -100000, max_steps
         results =  {"Episode": [], "No of steps": [], "Final position": [], "Reward Sum": [], "Q_loss": [], "Policy_loss": []}
         for i_episode in range(num_episodes):
-
+            
             if i_episode >= 999 and np.all(np.array(self.episode_durations[-1000:]) < max_steps):
                 break
 
@@ -294,78 +293,89 @@ class Train(object):
             state = torch.tensor(obs[0], dtype=torch.float32, device=device).unsqueeze(
                 0
             )
-            for t in count():
 
-                if t <= self.warmup:
-                    action = self.random_action()
-                else:
-                    action = self.select_action(state)
+            self.episode = i_episode
 
-                observation, reward, terminated, truncated, _ = self.env.step(
-                    action
-                )
-                # episode_reward += reward
-                # reward = torch.tensor([[reward]], device=device)
-                done = terminated or truncated
+            if self.eval_episodes is not None and (i_episode+1)%self.eval_episodes==0:
+                self.evaluation(state)
+                self.is_training = True
+            else:
+                for t in count():
 
-                if terminated:
-                    #reward = 0
-                    next_state = None  # if terminated, the agent was successfull
-                else:
-                    #reward = -1
-                    next_state = torch.tensor(
-                        observation, dtype=torch.float32, device=device
-                    ).unsqueeze(0)
+                    if t <= self.warmup:
+                        action = self.random_action()
+                    else:
+                        action = self.select_action(state)
 
-                episode_reward += reward
-                reward = torch.tensor([[reward]], device=device)
-                action = torch.tensor(action, dtype=torch.float32, device=device).unsqueeze(0)
-                # Store the transition in memory
-                self.memory.push(state, action, next_state, reward)
-
-                # Move to the next state
-                state = next_state
-                #previous_action = action
-
-                # Perform one step of the optimization (on the policy network)
-                if len(self.memory) >= self.BATCH_SIZE:
-                    Q_loss, policy_loss = self.optimize_model()
-
-                # Soft update of the target network's weights
-                # θ′ ← τ θ + (1 −τ )θ′
-                #self.soft_update()
-                soft_update(self.actor_target, self.actor, self.TAU)
-                soft_update(self.critic_target, self.critic, self.TAU)
-
-                # [optional] save intermideate model
-                #if (t + 1) == int(max_steps / 2):
-                #    self.save_model(w_path, t + 1, i_episode)
-
-                if done:
-                    self.episode_durations.append(t + 1)
-                    
-                    results_list = [i_episode, t+1, round(state[0,0].item(), 4) if state is not None else state, episode_reward, Q_loss.item(), policy_loss.item()]
-                    for v, k in zip(results_list, results.keys()):
-                        results[k].append(v)
-
-                    print(
-                        f"Episode {results_list[0]}: steps={results_list[1]}, pos_T={results_list[2]}, episode_reward={round(episode_reward, 4)}, Q_loss={round(Q_loss.item(), 4)}, P_loss={round(policy_loss.item(), 4)}"
+                    observation, reward, terminated, truncated, _ = self.env.step(
+                        action
                     )
+                    # episode_reward += reward
+                    # reward = torch.tensor([[reward]], device=device)
+                    done = terminated or truncated
 
-                    # plot_durations()
-                    if episode_reward > max_ER:
-                        self.save_model(w_path, t + 1, i_episode)
-                        max_ER = episode_reward
-                    elif (t+1) < min_no_steps:
-                        self.save_model(w_path, t + 1, i_episode)
-                        min_no_steps = t+1
-                    
-                    df = pd.DataFrame(results) #, columns=results.keys())
-                    df.to_excel(w_path + "/results.xlsx", index=True)
+                    if terminated:
+                        #reward = 0
+                        next_state = None  # if terminated, the agent was successfull
+                    else:
+                        #reward = -1
+                        next_state = torch.tensor(
+                            observation, dtype=torch.float32, device=device
+                        ).unsqueeze(0)
 
-                    if self.warmup_decay is not None:
-                        self.set_warmup()
-                    break
+                    episode_reward += reward
+                    reward = torch.tensor([[reward]], device=device)
+                    action = torch.tensor(action, dtype=torch.float32, device=device).unsqueeze(0)
+                    # Store the transition in memory
+                    if t > self.warmup: #the first random actions should not be used to train the model
+                        self.memory.push(state, action, next_state, reward)
+
+                    # Move to the next state
+                    state = next_state
+                    #previous_action = action
+
+                    # Perform one step of the optimization (on the policy network)
+                    if len(self.memory) >= self.BATCH_SIZE:
+                        Q_loss, policy_loss = self.optimize_model(terminated=False)
+
+                    # Soft update of the target network's weights
+                    # θ′ ← τ θ + (1 −τ )θ′
+                    #self.soft_update()
+                    soft_update(self.actor_target, self.actor, self.TAU)
+                    soft_update(self.critic_target, self.critic, self.TAU)
+
+                    # [optional] save intermideate model
+                    #if (t + 1) == int(max_steps / 2):
+                    #    self.save_model(w_path, t + 1, i_episode)
+
+                    if done:
+                        self.episode_durations.append(t + 1)
+                        
+                        results_list = [i_episode, t+1, round(state[0,0].item(), 4) if state is not None else state, episode_reward, Q_loss.item(), policy_loss.item()]
+                        for v, k in zip(results_list, results.keys()):
+                            results[k].append(v)
+
+                        print(
+                            f"Episode {results_list[0]}: steps={results_list[1]}, pos_T={results_list[2]}, episode_reward={round(episode_reward, 4)}, Q_loss={round(Q_loss.item(), 4)}, P_loss={round(policy_loss.item(), 4)}"
+                        )
+
+                        # plot_durations()
+                        if episode_reward > max_ER:
+                            self.save_model(w_path, t + 1, i_episode)
+                            max_ER = episode_reward
+                        elif (t+1) < min_no_steps:
+                            self.save_model(w_path, t + 1, i_episode)
+                            min_no_steps = t+1
+                        
+                        df = pd.DataFrame(results) #, columns=results.keys())
+                        df.to_excel(w_path + "/results.xlsx", index=True)
+
+                        df_chek = pd.DataFrame(self.check)
+                        df_chek.to_excel(w_path + "/check.xlsx", index=True)
+
+                        if self.warmup_decay is not None:
+                            self.set_warmup()
+                        break
 
         print("Complete")
         # plot_durations(show_result=True)
@@ -382,3 +392,33 @@ class Train(object):
             self.critic.state_dict(),
             "{}/critic_E{}_step{}.pkl".format(output, episode, step),
         )
+
+    def evaluation(self, state):
+        self.is_training = False
+        episode_reward = 0
+        path = self.save_path + f"/eval/Episode{self.episode}"
+        os.makedirs(path, exist_ok=True)
+        for t in count():
+            action = self.select_action(state, decay_epsilon=False)
+            observation, reward, terminated, truncated, _ = self.env.step(
+                action
+            )
+
+            done = terminated or truncated
+            if t%50 == 0 or terminated:
+                print(observation[0], action[0], reward)
+                # Render the env
+                env_screen = self.env.render()
+                cv2.imwrite(path+f"/{t}.png", env_screen)
+                #cv2.imshow(f"S: {state}, A: {action}, R: {reward}, S': {observation}", env_screen)
+                #cv2.waitKey(1000) #& 0xFF
+
+            episode_reward += reward
+            if done:
+                print(f"**** EVAL EPISODE: episode_reward={episode_reward}")
+                cv2.destroyAllWindows()
+                break
+            else:
+                state = torch.tensor(
+                    observation, dtype=torch.float32, device=device
+                ).unsqueeze(0)
